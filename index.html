@@ -67,3 +67,874 @@
   </aside>
   <main><div id="view"></div><div id="hint">drag: rotate &middot; wheel: zoom &middot; right-drag: pan</div></main>
 </div>
+
+<!-- ================= CORE: parser + mesh builder + STL writer (no DOM, unit-testable in Node) ================= -->
+<script id="core">
+// ==== CORE BEGIN ====
+const COV = {
+  H:.31,He:.28,Li:1.28,Be:.96,B:.84,C:.76,N:.71,O:.66,F:.57,Ne:.58,
+  Na:1.66,Mg:1.41,Al:1.21,Si:1.11,P:1.07,S:1.05,Cl:1.02,Ar:1.06,
+  K:2.03,Ca:1.76,Sc:1.70,Ti:1.36,V:1.25,Cr:1.27,Mn:1.39,Fe:1.32,Co:1.26,Ni:1.21,Cu:1.32,Zn:1.22,
+  Ga:1.22,Ge:1.22,As:1.19,Se:1.16,Br:1.20,Kr:1.16,Rb:2.20,Sr:1.95,Y:1.90,Zr:1.48,Nb:1.37,Mo:1.45,
+  Tc:1.56,Ru:1.26,Rh:1.35,Pd:1.31,Ag:1.45,Cd:1.48,In:1.42,Sn:1.40,Sb:1.38,Te:1.35,I:1.39,Xe:1.40,
+  Cs:2.44,Ba:2.15,Pt:1.28,Au:1.36,Hg:1.49,Pb:1.46
+};
+const CPK = {
+  H:0xffffff,C:0x909090,N:0x3050f8,O:0xff0d0d,F:0x90e050,Cl:0x1ff01f,Br:0xa62929,I:0x940094,P:0xff8000,
+  S:0xffff30,B:0xffb5b5,Si:0xf0c8a0,Na:0xab5cf2,Mg:0x8aff00,K:0x8f40d4,Ca:0x3dff00,Fe:0xe06633,Cu:0xc88033,
+  Zn:0x7d80b0,Al:0xbfa6a6,Ti:0xbfc2c7,Cr:0x8a99c7,Mn:0x9c7ac7,Co:0xf090a0,Ni:0x50d050,Ag:0xc0c0c0,Au:0xffd123,Pb:0x575961
+};
+const NAMED = {
+  red:0xff0000,green:0x00a000,blue:0x0000ff,white:0xffffff,black:0x000000,gray:0x808080,grey:0x808080,
+  yellow:0xffff00,orange:0xffa500,cyan:0x00ffff,magenta:0xff00ff,purple:0x800080,brown:0xa52a2a,pink:0xffc0cb
+};
+
+// Typical valences for neutral elements (used for bond order perception)
+const VALENCE = {
+  H: 1, He: 0, Li: 1, Be: 2, B: 3, C: 4, N: 3, O: 2, F: 1, Ne: 0,
+  Na: 1, Mg: 2, Al: 3, Si: 4, P: 3, S: 2, Cl: 1, Ar: 0,
+  K: 1, Ca: 2, Sc: 3, Ti: 4, V: 5, Cr: 6, Mn: 7, Fe: 3, Co: 3, Ni: 2, Cu: 2, Zn: 2,
+  Br: 1, I: 1
+};
+
+function elementOf(label) {
+  const m = /^[A-Za-z]+/.exec(label);
+  if (!m) return 'C';
+  const lead = m[0], e = lead[0].toUpperCase() + lead.slice(1).toLowerCase();
+  return (e in COV) ? e : lead[0].toUpperCase();
+}
+function rgbToHex(r, g, b) {
+  const c = v => Math.max(0, Math.min(255, Math.round(v * 255)));
+  return (c(r) << 16) | (c(g) << 8) | c(b);
+}
+function parseColor(tok) {
+  if (!tok || !tok.length) return null;
+  const n = tok.map(Number);
+  if (n.every(Number.isFinite)) {
+    if (n.length === 1) return rgbToHex(n[0], n[0], n[0]);
+    if (n.length >= 3) return rgbToHex(n[0], n[1], n[2]);
+    return null;
+  }
+  const k = tok[0].toLowerCase();
+  return (k in NAMED) ? NAMED[k] : null;
+}
+function wildcard(p) {
+  return new RegExp('^' + p.replace(/[.^$|()\[\]{}\\?]/g, '\\$&').replace(/\*/g, '.*').replace(/\+/g, '.') + '$');
+}
+
+function isAtomCoordLine(tok) {
+  if (tok.length < 4) return false;
+  if (!/^[A-Za-z]+[0-9]*$/.test(tok[0])) return false;
+  const x = Number(tok[1]), y = Number(tok[2]), z = Number(tok[3]);
+  return Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z);
+}
+
+function detectBSFormat(text) {
+  const clean = (text.charCodeAt(0) === 0xFEFF ? text.slice(1) : text);
+  const lines = clean.split(/\r\n|\n|\r/);
+  let hasXbsAtom = false, hasXbsSpecOrBonds = false, hasCoordLines = false;
+  const meaningful = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const t = lines[i].trim();
+    if (!t || t.startsWith('*') || t.startsWith('#')) continue;
+    meaningful.push({ text: t, line: i + 1 });
+    const tok = t.split(/\s+/);
+    const key = tok[0].toLowerCase();
+    if (key === 'atom' && tok.length >= 5 && [Number(tok[2]), Number(tok[3]), Number(tok[4])].every(Number.isFinite)) {
+      hasXbsAtom = true;
+    } else if (key === 'spec' || key === 'bonds') {
+      hasXbsSpecOrBonds = true;
+    } else if (isAtomCoordLine(tok)) {
+      hasCoordLines = true;
+    }
+  }
+
+  if (hasXbsAtom || hasXbsSpecOrBonds) return 'xbs';
+
+  if (meaningful.length >= 2) {
+    if (/^\d+$/.test(meaningful[0].text) && isAtomCoordLine(meaningful[1].text.split(/\s+/))) {
+      return 'avogadro-bs';
+    }
+    if (/^\d+/.test(meaningful[1].text) && meaningful.length > 2 && isAtomCoordLine(meaningful[2].text.split(/\s+/))) {
+      return 'avogadro-bs';
+    }
+  }
+
+  if (hasCoordLines) return 'avogadro-bs';
+  return 'unknown';
+}
+
+function parseXBS(text) {
+  const clean = (text.charCodeAt(0) === 0xFEFF ? text.slice(1) : text);
+  const lines = clean.split(/\r\n|\n|\r/);
+  const atoms = [], specs = new Map(), rules = [], ignored = new Map(), warnings = [];
+
+  lines.forEach((raw, i) => {
+    const t = raw.trim();
+    if (!t || t.startsWith('*') || t.startsWith('#')) return;
+    const tok = t.split(/\s+/), key = tok[0].toLowerCase();
+    if (key === 'atom') {
+      const x = Number(tok[2]), y = Number(tok[3]), z = Number(tok[4]);
+      if (tok.length < 5 || ![x, y, z].every(Number.isFinite)) {
+        warnings.push('Line ' + (i + 1) + ': bad atom line skipped');
+        return;
+      }
+      atoms.push({ sym: tok[1], x, y, z });
+    } else if (key === 'spec') {
+      const r = Number(tok[2]);
+      if (tok.length < 3 || !Number.isFinite(r)) {
+        warnings.push('Line ' + (i + 1) + ': bad spec line skipped');
+        return;
+      }
+      specs.set(tok[1], { radius: r, color: parseColor(tok.slice(3)) });
+    } else if (key === 'bonds') {
+      const mn = Number(tok[3]), mx = Number(tok[4]);
+      if (tok.length < 5 || ![mn, mx].every(Number.isFinite)) {
+        warnings.push('Line ' + (i + 1) + ': bad bonds line skipped');
+        return;
+      }
+      rules.push({ a: wildcard(tok[1]), b: wildcard(tok[2]), min: mn, max: mx, color: parseColor(tok.slice(6)) });
+    } else {
+      ignored.set(key, (ignored.get(key) || 0) + 1);
+    }
+  });
+
+  if (atoms.length === 0) {
+    throw new Error('No "atom" records found - is this an XBS .bs file?');
+  }
+
+  return { atoms, specs, rules, explicitBonds: null, format: 'xbs', ignored, warnings };
+}
+
+function parseAvogadroBS(text) {
+  const clean = (text.charCodeAt(0) === 0xFEFF ? text.slice(1) : text);
+  const lines = clean.split(/\r\n|\n|\r/);
+  const atoms = [], specs = new Map(), rules = [], ignored = new Map(), warnings = [];
+  const explicitBonds = [];
+  const neighborPairs = new Map();
+
+  const meaningful = [];
+  lines.forEach((raw, i) => {
+    const t = raw.trim();
+    if (!t || t.startsWith('*') || t.startsWith('#')) return;
+    meaningful.push({ text: t, line: i + 1 });
+  });
+
+  if (meaningful.length === 0) {
+    throw new Error('Empty file - no data found.');
+  }
+
+  let startIndex = 0, declaredCount = null, title = '';
+  const isCoord = entry => isAtomCoordLine(entry.text.split(/\s+/));
+
+  if (meaningful.length >= 2 && !isCoord(meaningful[0]) && /^\d+/.test(meaningful[1].text)) {
+    title = meaningful[0].text;
+    declaredCount = parseInt(meaningful[1].text, 10);
+    startIndex = 2;
+  } else if (/^\d+/.test(meaningful[0].text)) {
+    declaredCount = parseInt(meaningful[0].text, 10);
+    startIndex = 1;
+  } else {
+    while (startIndex < meaningful.length && !isCoord(meaningful[startIndex])) {
+      startIndex++;
+    }
+  }
+
+  const atomRows = (declaredCount != null && declaredCount > 0)
+    ? meaningful.slice(startIndex, startIndex + declaredCount)
+    : meaningful.slice(startIndex).filter(isCoord);
+
+  atomRows.forEach((entry, i) => {
+    const tok = entry.text.split(/\s+/);
+    const sym = tok[0];
+    const x = Number(tok[1]), y = Number(tok[2]), z = Number(tok[3]);
+    if (![x, y, z].every(Number.isFinite)) {
+      warnings.push('Line ' + entry.line + ': invalid coordinates for atom ' + (i + 1) + ' skipped');
+      return;
+    }
+    atoms.push({ sym, x, y, z });
+
+    for (const rawIndex of tok.slice(4)) {
+      const neighbor = Number(rawIndex);
+      if (!Number.isInteger(neighbor)) continue;
+      const j = neighbor - 1;
+      if (j === i) {
+        warnings.push('Line ' + entry.line + ': self-bond ignored');
+        continue;
+      }
+      const a = Math.min(i, j), b = Math.max(i, j);
+      const key = a + ':' + b;
+      if (!neighborPairs.has(key)) {
+        neighborPairs.set(key, true);
+        explicitBonds.push([a, b, entry.line, rawIndex]);
+      }
+    }
+  });
+
+  if (atoms.length === 0) {
+    throw new Error('No atom coordinate rows found - is this a valid Avogadro / Ball-and-Stick .bs file?');
+  }
+
+  if (declaredCount != null && atoms.length !== declaredCount) {
+    warnings.push('Header declared ' + declaredCount + ' atoms, but ' + atoms.length + ' valid atom rows were read.');
+  }
+
+  const validBonds = [];
+  for (const [a, b, lineNum, rawIdx] of explicitBonds) {
+    if (a >= 0 && b < atoms.length) {
+      validBonds.push({ i: a, j: b, order: 1 });
+    } else {
+      warnings.push('Line ' + lineNum + ': neighbor index "' + rawIdx + '" out of atom range (1..' + atoms.length + ') ignored');
+    }
+  }
+
+  return { atoms, specs, rules, explicitBonds: validBonds, format: 'avogadro-bs', title, ignored, warnings };
+}
+
+function perceiveBondOrders(atoms, bonds) {
+  const n = atoms.length;
+  const adj = Array.from({ length: n }, () => []);
+  const bondList = [];
+  const bondMap = new Map();
+
+  bonds.forEach(b => {
+    const i = b.i !== undefined ? b.i : b[0];
+    const j = b.j !== undefined ? b.j : b[1];
+    const initialOrder = b.order || (b[2] && typeof b[2] === 'number' ? b[2] : 1);
+    const color = b.color || 0xcccccc;
+    const u = Math.min(i, j), v = Math.max(i, j);
+    const key = u + ':' + v;
+
+    let existing = bondMap.get(key);
+    if (!existing) {
+      existing = { i: u, j: v, order: initialOrder, color };
+      bondMap.set(key, existing);
+      bondList.push(existing);
+      adj[u].push(v);
+      adj[v].push(u);
+    } else if (b.order > existing.order) {
+      existing.order = b.order;
+    }
+  });
+
+  const dist = (i, j) => Math.hypot(atoms[i].x - atoms[j].x, atoms[i].y - atoms[j].y, atoms[i].z - atoms[j].z);
+
+  const currentValence = new Array(n).fill(0);
+  for (const b of bondList) {
+    currentValence[b.i] += b.order;
+    currentValence[b.j] += b.order;
+  }
+
+  const targetValence = new Array(n);
+  for (let i = 0; i < n; i++) {
+    const sym = elementOf(atoms[i].sym);
+    let tv = VALENCE[sym] ?? adj[i].length;
+    if (sym === 'S') {
+      const oxygens = adj[i].filter(nb => elementOf(atoms[nb].sym) === 'O').length;
+      if (oxygens >= 2) tv = 6;
+      else if (oxygens === 1) tv = 4;
+    } else if (sym === 'P') {
+      const oxygens = adj[i].filter(nb => elementOf(atoms[nb].sym) === 'O').length;
+      if (oxygens >= 1) tv = 5;
+    } else if (sym === 'N') {
+      const oxygens = adj[i].filter(nb => elementOf(atoms[nb].sym) === 'O').length;
+      if (oxygens >= 2) tv = 4;
+    }
+    targetValence[i] = Math.max(tv, adj[i].length);
+  }
+
+  const deficit = new Array(n);
+  for (let i = 0; i < n; i++) {
+    deficit[i] = Math.max(0, targetValence[i] - currentValence[i]);
+  }
+
+  const candidates = [];
+  for (const b of bondList) {
+    const i = b.i, j = b.j;
+    if (deficit[i] > 0 && deficit[j] > 0) {
+      const d = dist(i, j);
+      candidates.push({ b, i, j, d });
+    }
+  }
+
+  candidates.sort((a, b) => a.d - b.d);
+
+  for (const c of candidates) {
+    const i = c.i, j = c.j;
+    const canAdd = Math.min(deficit[i], deficit[j]);
+    if (canAdd <= 0) continue;
+
+    const d = c.d;
+    const s1 = elementOf(atoms[i].sym), s2 = elementOf(atoms[j].sym);
+    const pair = [s1, s2].sort().join('');
+    let targetOrder = 1;
+
+    if (pair === 'CO') {
+      if (d < 1.15 && canAdd >= 2) targetOrder = 3;
+      else if (d < 1.28) targetOrder = 2;
+    } else if (pair === 'CC') {
+      if (d < 1.24 && canAdd >= 2) targetOrder = 3;
+      else if (d < 1.45) targetOrder = 2;
+    } else if (pair === 'CN') {
+      if (d < 1.20 && canAdd >= 2) targetOrder = 3;
+      else if (d < 1.35) targetOrder = 2;
+    } else if (pair === 'NO') {
+      if (d < 1.26) targetOrder = 2;
+    } else if (pair === 'NN') {
+      if (d < 1.15 && canAdd >= 2) targetOrder = 3;
+      else if (d < 1.28) targetOrder = 2;
+    } else if (pair === 'CS') {
+      if (d < 1.68) targetOrder = 2;
+    } else if (pair === 'OS') {
+      if (d < 1.52) targetOrder = 2;
+    } else if (pair === 'OP') {
+      if (d < 1.54) targetOrder = 2;
+    } else if (canAdd >= 1 && d < 1.40) {
+      targetOrder = 2;
+    }
+
+    const added = Math.min(canAdd, targetOrder - c.b.order);
+    if (added > 0) {
+      c.b.order += added;
+      deficit[i] -= added;
+      deficit[j] -= added;
+    }
+  }
+
+  // Ring kekulization pass for conjugated systems (e.g. aromatic rings)
+  for (const b of bondList) {
+    const i = b.i, j = b.j;
+    if (b.order === 1 && deficit[i] > 0 && deficit[j] > 0) {
+      const d = dist(i, j);
+      if (d < 1.46) {
+        b.order += 1;
+        deficit[i] -= 1;
+        deficit[j] -= 1;
+      }
+    }
+  }
+
+  return bondList;
+}
+
+function parseBS(text) {
+  const fmt = detectBSFormat(text);
+  if (fmt === 'xbs') return parseXBS(text);
+  if (fmt === 'avogadro-bs') return parseAvogadroBS(text);
+  try {
+    return parseAvogadroBS(text);
+  } catch (e1) {
+    try {
+      return parseXBS(text);
+    } catch (e2) {
+      throw new Error('Unrecognized format: file contains neither valid Avogadro / Ball-and-Stick coordinates nor XBS records.');
+    }
+  }
+}
+
+const DETAIL = [{ nlat: 10, nlon: 20, nseg: 12 }, { nlat: 16, nlon: 32, nseg: 20 }, { nlat: 28, nlon: 56, nseg: 32 }];
+
+function sphereTemplate(nlat, nlon) {
+  const ring = [];
+  for (let i = 0; i <= nlat; i++) {
+    const t = Math.PI * i / nlat, r = [];
+    for (let j = 0; j < nlon; j++) {
+      const p = 2 * Math.PI * j / nlon;
+      r.push([Math.sin(t) * Math.cos(p), Math.sin(t) * Math.sin(p), Math.cos(t)]);
+    }
+    ring.push(r);
+  }
+  const out = [];
+  for (let i = 0; i < nlat; i++) {
+    for (let j = 0; j < nlon; j++) {
+      const k = (j + 1) % nlon, a = ring[i], b = ring[i + 1];
+      if (i > 0) out.push(...a[j], ...b[j], ...a[k]);
+      if (i < nlat - 1) out.push(...a[k], ...b[j], ...b[k]);
+    }
+  }
+  return Float32Array.from(out);
+}
+
+function buildModel(parsed, o) {
+  const warnings = parsed.warnings.slice(), { atoms, specs, rules } = parsed;
+  if (!atoms || !atoms.length) throw new Error('No atoms found to render.');
+  if (atoms.length > 5000) throw new Error(atoms.length + ' atoms is too many for the browser preview (limit 5000).');
+  const det = DETAIL[o.detail ?? 1];
+
+  let refSym = null, refRadius;
+  if (specs.has('C')) refSym = 'C'; else for (const s of specs.keys()) if (elementOf(s) === 'C') { refSym = s; break; }
+  if (refSym) refRadius = specs.get(refSym).radius;
+  else if (specs.size) {
+    refSym = specs.keys().next().value;
+    refRadius = specs.get(refSym).radius;
+    warnings.push('No carbon "spec" line; scaling ' + refSym + ' to the carbon radius instead.');
+  } else {
+    refSym = 'C';
+    refRadius = 0.6 * (COV.C ?? 0.76);
+    if (parsed.format === 'avogadro-bs') {
+      warnings.push('Ball-and-stick scaling: Carbon radius set to ' + o.carbonRadiusMm + ' mm; other elements scaled via covalent radii.');
+    } else {
+      warnings.push('No "spec" lines; assumed carbon radius ' + refRadius.toFixed(3) + ' (file units) and covalent-radius ratios for other atoms.');
+    }
+  }
+  if (!(refRadius > 0)) throw new Error('Reference radius for ' + refSym + ' is not positive.');
+  const s = o.carbonRadiusMm / refRadius;
+  const refCov = COV[elementOf(refSym)] ?? COV.C;
+
+  const fallback = new Set();
+  const radFile = lab => {
+    const sp = specs.get(lab);
+    if (sp) return sp.radius;
+    fallback.add(lab);
+    return refRadius * (COV[elementOf(lab)] ?? COV.C) / refCov;
+  };
+  const colorOf = lab => {
+    const sp = specs.get(lab);
+    return (sp && sp.color != null) ? sp.color : (CPK[elementOf(lab)] ?? 0xb0b0b0);
+  };
+
+  const n = atoms.length, R = new Float32Array(n), P = new Float64Array(3 * n);
+  for (let i = 0; i < n; i++) {
+    R[i] = radFile(atoms[i].sym) * s;
+    P[3 * i] = atoms[i].x * s;
+    P[3 * i + 1] = atoms[i].y * s;
+    P[3 * i + 2] = atoms[i].z * s;
+  }
+
+  const rawBonds = [];
+  if (parsed.explicitBonds && parsed.explicitBonds.length > 0) {
+    for (const b of parsed.explicitBonds) {
+      const i = b.i !== undefined ? b.i : b[0];
+      const j = b.j !== undefined ? b.j : b[1];
+      if (i >= 0 && j >= 0 && i < n && j < n && i !== j) {
+        rawBonds.push({ i, j, order: b.order || 1, color: 0xcccccc });
+      }
+    }
+    warnings.push('Connectivity imported from ' + rawBonds.length + ' explicit bond(s) in file.');
+  } else {
+    const cache = new Map(), match = (a, b) => {
+      const k = a + '\0' + b;
+      let v = cache.get(k);
+      if (v === undefined) {
+        v = [];
+        rules.forEach((r, idx) => {
+          if ((r.a.test(a) && r.b.test(b)) || (r.a.test(b) && r.b.test(a))) v.push(idx);
+        });
+        cache.set(k, v);
+      }
+      return v;
+    };
+    const useAuto = rules.length === 0;
+    if (useAuto) {
+      warnings.push('No explicit bonds or "bonds" rules; bonds estimated from covalent radii (+0.4 Å).');
+    }
+    for (let i = 0; i < n; i++) {
+      for (let j = i + 1; j < n; j++) {
+        const dx = (P[3 * i] - P[3 * j]) / s, dy = (P[3 * i + 1] - P[3 * j + 1]) / s, dz = (P[3 * i + 2] - P[3 * j + 2]) / s;
+        const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        if (useAuto) {
+          const lim = (COV[elementOf(atoms[i].sym)] ?? 0.77) + (COV[elementOf(atoms[j].sym)] ?? 0.77) + 0.4;
+          if (d > 0.1 && d <= lim) rawBonds.push({ i, j, order: 1, color: 0xcccccc });
+          continue;
+        }
+        for (const ri of match(atoms[i].sym, atoms[j].sym)) {
+          const r = rules[ri];
+          if (d >= r.min && d <= r.max) {
+            rawBonds.push({ i, j, order: 1, color: r.color ?? 0xcccccc });
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  // Perceive bond orders (single, double, triple) from valences and 3D distances
+  const bonds = perceiveBondOrders(atoms, rawBonds);
+  let countSingle = 0, countDouble = 0, countTriple = 0;
+  for (const b of bonds) {
+    if (b.order === 3) countTriple++;
+    else if (b.order === 2) countDouble++;
+    else countSingle++;
+  }
+  if (countDouble > 0 || countTriple > 0) {
+    warnings.push('Detected ' + countDouble + ' double bond(s)' + (countTriple ? ' and ' + countTriple + ' triple bond(s)' : '') + ' via 3D distance and valence geometry.');
+  }
+
+  const rb = (o.bondIsDiameter ? o.bondThickness / 2 : o.bondThickness);
+  const style = o.multipleBonds ?? 'parallel';
+  let totalCylinders = 0;
+  for (const b of bonds) {
+    if (style === 'parallel') totalCylinders += (b.order || 1);
+    else totalCylinders += 1;
+  }
+
+  const sph = sphereTemplate(det.nlat, det.nlon), sphT = sph.length / 9, cylT = 4 * det.nseg;
+  const nTri = n * sphT + totalCylinders * cylT;
+  const pos = new Float32Array(nTri * 9), nrm = new Float32Array(nTri * 9), col = new Float32Array(nTri * 9);
+  let w = 0;
+  const put = (px, py, pz, nx, ny, nz, c) => {
+    pos[w] = px; pos[w+1] = py; pos[w+2] = pz;
+    nrm[w] = nx; nrm[w+1] = ny; nrm[w+2] = nz;
+    col[w] = (c >> 16 & 255) / 255; col[w+1] = (c >> 8 & 255) / 255; col[w+2] = (c & 255) / 255;
+    w += 3;
+  };
+
+  for (let i = 0; i < n; i++) {
+    const c = colorOf(atoms[i].sym), r = R[i];
+    for (let k = 0; k < sph.length; k += 3) {
+      put(P[3*i] + r*sph[k], P[3*i+1] + r*sph[k+1], P[3*i+2] + r*sph[k+2], sph[k], sph[k+1], sph[k+2], c);
+    }
+  }
+
+  function addCylinder(q0, q1, r, colorVal) {
+    const ax = q1[0] - q0[0], ay = q1[1] - q0[1], az = q1[2] - q0[2];
+    const L = Math.hypot(ax, ay, az);
+    if (L <= 1e-6) return;
+    const zx = ax / L, zy = ay / L, zz = az / L;
+
+    let hx = 1, hy = 0, hz = 0;
+    if (Math.abs(zx) > 0.9) { hx = 0; hy = 1; }
+    let xx = hy*zz - hz*zy, xy = hz*zx - hx*zz, xz = hx*zy - hy*zx;
+    const xl = Math.hypot(xx, xy, xz);
+    xx /= xl; xy /= xl; xz /= xl;
+    const yx = zy*xz - zz*xy, yy = zz*xx - zx*xz, yz = zx*xy - zy*xx;
+
+    const D = [];
+    for (let k = 0; k < det.nseg; k++) {
+      const a = 2 * Math.PI * k / det.nseg, c1 = Math.cos(a), s1 = Math.sin(a);
+      D.push([c1*xx + s1*yx, c1*xy + s1*yy, c1*xz + s1*yz]);
+    }
+
+    const B = d => [q0[0] + r*d[0], q0[1] + r*d[1], q0[2] + r*d[2]];
+    const T = d => [q1[0] + r*d[0], q1[1] + r*d[1], q1[2] + r*d[2]];
+    const V = (p, nn) => put(p[0], p[1], p[2], nn[0], nn[1], nn[2], colorVal);
+
+    for (let k = 0; k < det.nseg; k++) {
+      const d0 = D[k], d1 = D[(k + 1) % det.nseg];
+      const b0 = B(d0), b1 = B(d1), t0 = T(d0), t1 = T(d1);
+      const nb = [-zx, -zy, -zz], nt = [zx, zy, zz];
+      V(b0, d0); V(b1, d1); V(t1, d1);
+      V(b0, d0); V(t1, d1); V(t0, d0);
+      V(q0, nb); V(b1, nb); V(b0, nb);
+      V(q1, nt); V(t0, nt); V(t1, nt);
+    }
+  }
+
+  // Build local atom adjacency list to orient parallel double/triple bonds in plane
+  const adj = Array.from({ length: n }, () => []);
+  for (const b of bonds) {
+    adj[b.i].push(b.j);
+    adj[b.j].push(b.i);
+  }
+
+  let stubby = 0;
+  for (const b of bonds) {
+    const i = b.i, j = b.j;
+    const ax = P[3*j]-P[3*i], ay = P[3*j+1]-P[3*i+1], az = P[3*j+2]-P[3*i+2];
+    const L = Math.hypot(ax, ay, az);
+    if (L <= 1e-6) continue;
+    if (L - R[i] - R[j] <= 0) stubby++;
+
+    const p0 = [P[3*i], P[3*i+1], P[3*i+2]], p1 = [P[3*j], P[3*j+1], P[3*j+2]];
+    const colVal = b.color ?? 0xcccccc;
+    const order = b.order || 1;
+
+    if (style !== 'parallel' || order === 1) {
+      const r = (style === 'thick' ? (order === 3 ? 1.65 : (order === 2 ? 1.35 : 1)) : 1) * rb;
+      addCylinder(p0, p1, r, colVal);
+      continue;
+    }
+
+    const zx = ax / L, zy = ay / L, zz = az / L;
+
+    // Find reference neighbor in local bonding plane
+    let refK = adj[i].find(k => k !== j);
+    if (refK === undefined) refK = adj[j].find(k => k !== i);
+
+    let ux, uy, uz;
+    if (refK !== undefined) {
+      const wx = P[3*refK] - P[3*i], wy = P[3*refK+1] - P[3*i+1], wz = P[3*refK+2] - P[3*i+2];
+      const dot = wx * zx + wy * zy + wz * zz;
+      const px = wx - dot * zx, py = wy - dot * zy, pz = wz - dot * zz;
+      const pl = Math.hypot(px, py, pz);
+      if (pl > 1e-4) {
+        ux = px / pl; uy = py / pl; uz = pz / pl;
+      }
+    }
+
+    if (ux === undefined) {
+      let hx = 1, hy = 0, hz = 0;
+      if (Math.abs(zx) > 0.9) { hx = 0; hy = 1; }
+      const cx = hy * zz - hz * zy, cy = hz * zx - hx * zz, cz = hx * zy - hy * zx;
+      const cl = Math.hypot(cx, cy, cz);
+      ux = cx / cl; uy = cy / cl; uz = cz / cl;
+    }
+
+    const vx = zy * uz - zz * uy, vy = zz * ux - zx * uz, vz = zx * uy - zy * ux;
+
+    if (order === 2) {
+      const rStrut = 0.65 * rb;
+      const dOff = 0.85 * rb;
+      const oAx = dOff * ux, oAy = dOff * uy, oAz = dOff * uz;
+      addCylinder([p0[0] + oAx, p0[1] + oAy, p0[2] + oAz], [p1[0] + oAx, p1[1] + oAy, p1[2] + oAz], rStrut, colVal);
+      addCylinder([p0[0] - oAx, p0[1] - oAy, p0[2] - oAz], [p1[0] - oAx, p1[1] - oAy, p1[2] - oAz], rStrut, colVal);
+    } else if (order === 3) {
+      const rStrut = 0.55 * rb;
+      const dOff = 0.95 * rb;
+      for (let k = 0; k < 3; k++) {
+        const ang = k * (2 * Math.PI / 3);
+        const ca = Math.cos(ang), sa = Math.sin(ang);
+        const ox = dOff * (ca * ux + sa * vx);
+        const oy = dOff * (ca * uy + sa * vy);
+        const oz = dOff * (ca * uz + sa * vz);
+        addCylinder([p0[0] + ox, p0[1] + oy, p0[2] + oz], [p1[0] + ox, p1[1] + oy, p1[2] + oz], rStrut, colVal);
+      }
+    }
+  }
+
+  let mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];
+  for (let k = 0; k < pos.length; k += 3) {
+    for (let a = 0; a < 3; a++) {
+      const v = pos[k + a];
+      if (v < mn[a]) mn[a] = v;
+      if (v > mx[a]) mx[a] = v;
+    }
+  }
+  const cen = [0, 1, 2].map(a => (mn[a] + mx[a]) / 2);
+  for (let k = 0; k < pos.length; k += 3) {
+    for (let a = 0; a < 3; a++) pos[k + a] -= cen[a];
+  }
+
+  const counts = new Map();
+  atoms.forEach(a => counts.set(a.sym, (counts.get(a.sym) || 0) + 1));
+  const species = [...counts].map(([label, count]) => ({
+    label,
+    count,
+    radiusMm: radFile(label) * s,
+    color: colorOf(label),
+    fallback: fallback.has(label)
+  }));
+
+  if (fallback.size && specs.size) {
+    warnings.push('No "spec" line for ' + [...fallback].join(', ') + '; radius estimated from covalent-radius ratio.');
+  }
+  if (stubby) {
+    warnings.push(stubby + ' bond(s) are shorter than the two balls\' radii combined - those sticks are hidden inside the balls.');
+  }
+  if (!bonds.length) {
+    warnings.push('0 bonds were found; the export is atoms only.');
+  }
+  const big = Math.max(...[0, 1, 2].map(a => mx[a] - mn[a]));
+  if (big > 300) {
+    warnings.push('Longest dimension is ' + big.toFixed(0) + ' mm - check it fits your build volume (you can also scale in the slicer).');
+  }
+
+  return {
+    pos, nrm, col, nTri, atoms: n, bonds: bonds.length,
+    singleBonds: countSingle, doubleBonds: countDouble, tripleBonds: countTriple,
+    scale: s, refSym, refRadius, species, warnings,
+    size: [0, 1, 2].map(a => mx[a] - mn[a]), sphT, cylT, nSph: n, nCyl: totalCylinders
+  };
+}
+
+function writeSTL(pos) {
+  const n = pos.length / 9, ab = new ArrayBuffer(84 + 50 * n), dv = new DataView(ab);
+  const hdr = 'bs2stl ball-and-stick mesh (binary STL)';
+  for (let i = 0; i < hdr.length; i++) dv.setUint8(i, hdr.charCodeAt(i));
+  dv.setUint32(80, n, true);
+  let o = 84;
+  for (let t = 0; t < n; t++) {
+    const b = t * 9;
+    const ex = pos[b+3]-pos[b], ey = pos[b+4]-pos[b+1], ez = pos[b+5]-pos[b+2];
+    const fx = pos[b+6]-pos[b], fy = pos[b+7]-pos[b+1], fz = pos[b+8]-pos[b+2];
+    let nx = ey*fz - ez*fy, ny = ez*fx - ex*fz, nz = ex*fy - ey*fx;
+    const l = Math.hypot(nx, ny, nz) || 1;
+    nx /= l; ny /= l; nz /= l;
+    dv.setFloat32(o, nx, true); dv.setFloat32(o+4, ny, true); dv.setFloat32(o+8, nz, true);
+    for (let k = 0; k < 9; k++) dv.setFloat32(o + 12 + 4*k, pos[b + k], true);
+    dv.setUint16(o + 48, 0, true);
+    o += 50;
+  }
+  return ab;
+}
+// ==== CORE END ====
+</script>
+
+<!-- ================= VIEWER / UI ================= -->
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+               "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/" } }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const EXAMPLE_ACETONE = `Untitled
+10
+C     1.3051   -0.6772   -0.0000     2     5     6     7
+C     0.0000    0.0763   -0.0000     1     3     4
+O    -0.0000    1.2839    0.0000     2
+C    -1.3051   -0.6772    0.0000     2     8     9    10
+H     1.6198   -0.8588    1.0277     1
+H     1.1748   -1.6296   -0.5138     1
+H     2.0647   -0.0881   -0.5138     1
+H    -1.1059   -1.7488   -0.0000     4
+H    -1.8767   -0.4138    0.8900     4
+H    -1.8767   -0.4138   -0.8900     4
+`;
+
+const EXAMPLE_ASPIRIN = `* aspirin test molecule, XBS .bs format
+atom  C     3.4038    0.5543    0.0552
+atom  C     2.0439    0.1391    0.5312
+atom  O     1.6894    0.1441    1.7031
+atom  O     1.2884   -0.2659   -0.5636
+atom  C    -0.0284   -0.5847   -0.2190
+atom  C    -0.3282   -1.9424   -0.0674
+atom  C    -1.6290   -2.3304    0.2478
+atom  C    -2.6259   -1.3671    0.3983
+atom  C    -2.3267   -0.0114    0.2273
+atom  C    -1.0220    0.3968   -0.0914
+atom  C    -0.7032    1.8334   -0.3031
+atom  O     0.3609    2.3052   -0.6590
+atom  O    -1.7563    2.6373   -0.0592
+atom  H     3.9239   -0.3054   -0.3741
+atom  H     3.9844    0.9300    0.9025
+atom  H     3.3109    1.3562   -0.6817
+atom  H     0.4490   -2.6922   -0.1857
+atom  H    -1.8659   -3.3836    0.3782
+atom  H    -3.6405   -1.6701    0.6470
+atom  H    -3.1244    0.7190    0.3429
+atom  H    -1.4037    3.5378   -0.2188
+
+spec  C  0.400  0.5
+spec  H  0.250  1.0
+spec  O  0.380  1.0 0.0 0.0
+
+bonds C  C  0.000 1.800 0.109 0.8
+bonds C  H  0.000 1.300 0.109 0.8
+bonds C  O  0.000 1.700 0.109 0.8
+bonds O  H  0.000 1.200 0.109 0.8`;
+
+const $ = id => document.getElementById(id);
+const host = $('view');
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+host.appendChild(renderer.domElement);
+const scene = new THREE.Scene(); scene.background = new THREE.Color(0x1b1f24);
+const camera = new THREE.PerspectiveCamera(35, 1, 1, 20000);
+const controls = new OrbitControls(camera, renderer.domElement); controls.enableDamping = true;
+scene.add(new THREE.HemisphereLight(0xffffff, 0x445566, 0.9));
+const key = new THREE.DirectionalLight(0xffffff, 1.4); key.position.set(1, 1.5, 2); scene.add(key);
+const rim = new THREE.DirectionalLight(0x88aaff, 0.5); rim.position.set(-2, -1, -1); scene.add(rim);
+
+function resize() { const w = host.clientWidth, h = host.clientHeight; renderer.setSize(w, h); camera.aspect = w / h; camera.updateProjectionMatrix(); }
+new ResizeObserver(resize).observe(host); resize();
+(function loop() { requestAnimationFrame(loop); controls.update(); renderer.render(scene, camera); })();
+
+let mesh = null, model = null, text = null, name = 'molecule.bs';
+
+function frame() {
+  const g = mesh.geometry; g.computeBoundingSphere(); const r = g.boundingSphere.radius;
+  const d = r / Math.sin(THREE.MathUtils.degToRad(camera.fov / 2)) * 1.15;
+  camera.position.set(0.6 * d, 0.5 * d, 0.9 * d); camera.near = d / 100; camera.far = d * 10; camera.updateProjectionMatrix();
+  controls.target.set(0, 0, 0); controls.update();
+}
+
+function msg(cls, s) { const d = document.createElement('div'); d.className = 'msg ' + cls; d.textContent = s; $('msgs').appendChild(d); }
+function stat(k, v) { const d = document.createElement('div'), a = document.createElement('span'), b = document.createElement('span'); a.textContent = k; b.textContent = v; d.append(a, b); $('stats').appendChild(d); }
+const hex = c => '#' + c.toString(16).padStart(6, '0');
+
+function rebuild(refit) {
+  $('stats').replaceChildren(); $('species').replaceChildren(); $('msgs').replaceChildren(); $('dl').disabled = true;
+  if (text == null) return;
+  const opts = {
+    carbonRadiusMm: +$('cR').value,
+    bondThickness: +$('bT').value,
+    bondIsDiameter: $('bMode').value === 'd',
+    multipleBonds: $('bMult').value,
+    detail: +$('detail').value
+  };
+  if (!(opts.carbonRadiusMm > 0) || !(opts.bondThickness > 0)) { msg('err', 'Radius and thickness must be positive numbers.'); return; }
+  let parsed;
+  try {
+    parsed = parseBS(text);
+    model = buildModel(parsed, opts);
+  } catch (e) { msg('err', e.message); return; }
+
+  if (mesh) { scene.remove(mesh); mesh.geometry.dispose(); mesh.material.dispose(); }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(model.pos, 3));
+  g.setAttribute('normal', new THREE.BufferAttribute(model.nrm, 3));
+  g.setAttribute('color', new THREE.BufferAttribute(model.col, 3));
+  mesh = new THREE.Mesh(g, new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.45, metalness: 0 }));
+  scene.add(mesh); if (refit) frame();
+
+  stat('Input format', parsed.format === 'avogadro-bs' ? 'Avogadro / Ball-and-Stick .bs' : 'XBS .bs');
+  stat('Atoms', model.atoms);
+  stat('Bonds (total)', model.bonds);
+  if (model.doubleBonds > 0 || model.tripleBonds > 0) {
+    const parts = [`${model.singleBonds} single`];
+    if (model.doubleBonds > 0) parts.push(`${model.doubleBonds} double`);
+    if (model.tripleBonds > 0) parts.push(`${model.tripleBonds} triple`);
+    stat('Bond types', parts.join(', '));
+  }
+  stat('Triangles', model.nTri.toLocaleString());
+  stat('Size X x Y x Z (mm)', model.size.map(v => v.toFixed(1)).join(' x '));
+  stat('File units to mm', model.scale.toFixed(3) + ' (' + model.refSym + ' = ' + model.refRadius + ')');
+  stat('STL size', ((84 + 50 * model.nTri) / 1048576).toFixed(2) + ' MB');
+
+  const t = document.createElement('table'); t.innerHTML = '<tr><th>Species</th><th>Count</th><th>Radius mm</th></tr>';
+  for (const s of model.species) {
+    const tr = document.createElement('tr'), a = document.createElement('td'), b = document.createElement('td'), c = document.createElement('td'), sw = document.createElement('span');
+    sw.className = 'sw'; sw.style.background = hex(s.color); a.append(sw, s.label); b.textContent = s.count; c.textContent = s.radiusMm.toFixed(1) + (s.fallback ? ' (est.)' : '');
+    tr.append(a, b, c); t.appendChild(tr);
+  }
+  $('species').append(Object.assign(document.createElement('h2'), { textContent: 'Species' }), t);
+  for (const w of model.warnings) msg('warn', w);
+  if (model.nTri > 1500000) msg('warn', 'Very large mesh (' + model.nTri.toLocaleString() + ' triangles); consider Draft detail.');
+  $('dl').disabled = false;
+}
+
+async function load(file) {
+  try {
+    text = await file.text();
+    name = file.name;
+    $('fname').textContent = name;
+    rebuild(true);
+  } catch (err) {
+    msg('err', 'Failed to read file: ' + err.message);
+  }
+}
+
+$('pick').onclick = () => $('file').click();
+$('file').onchange = e => {
+  if (e.target.files && e.target.files[0]) {
+    load(e.target.files[0]);
+    e.target.value = '';
+  }
+};
+$('example').onclick = () => { text = EXAMPLE_ACETONE; name = 'acetone.bs'; $('fname').textContent = 'acetone.bs (Avogadro format)'; rebuild(true); };
+$('exampleXbs').onclick = () => { text = EXAMPLE_ASPIRIN; name = 'aspirin.bs'; $('fname').textContent = 'aspirin.bs (XBS format)'; rebuild(true); };
+for (const id of ['cR', 'bT', 'bMode', 'bMult', 'detail']) $(id).addEventListener('input', () => rebuild(false));
+$('dl').onclick = () => {
+  const blob = new Blob([writeSTL(model.pos)], { type: 'model/stl' }), a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = name.replace(/\.[^.]*$/, '') + '.stl'; document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+};
+addEventListener('dragover', e => { e.preventDefault(); $('drop').classList.add('over'); });
+addEventListener('dragleave', e => {
+  if (e.relatedTarget === null || e.target === document.documentElement) {
+    $('drop').classList.remove('over');
+  }
+});
+addEventListener('drop', e => {
+  e.preventDefault();
+  $('drop').classList.remove('over');
+  if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0]) {
+    load(e.dataTransfer.files[0]);
+  }
+});
+$('example').click();
+</script>
+</body>
+</html>
