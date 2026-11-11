@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ChemSTL — Molecular Ball-and-Stick STL Generator</title>
+<style>
+:root{--bg:#1b1f24;--panel:#242a31;--line:#37404a;--text:#e6e9ed;--dim:#9aa5b1;--accent:#4aa3ff;--warn:#ffb454;--err:#ff6b6b}
+*{box-sizing:border-box}html,body{height:100%;margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+#app{display:grid;grid-template-columns:340px 1fr;height:100%}aside{background:var(--panel);border-right:1px solid var(--line);padding:16px;overflow:auto}
+h1{font-size:18px;margin:0 0 3px}.sub{color:var(--dim);font-size:12px;margin:0 0 14px}h2{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--dim);margin:18px 0 6px}
+label{display:flex;justify-content:space-between;align-items:center;gap:8px;margin:7px 0}input[type=number],select{width:120px;background:#161a1f;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:6px}
+button{background:var(--accent);color:#04121f;border:0;border-radius:6px;padding:8px 12px;font-weight:650;cursor:pointer}button.secondary{background:#2f3943;color:var(--text);font-weight:500}button:disabled{opacity:.4;cursor:not-allowed}
+.row{display:flex;gap:8px;flex-wrap:wrap}.drop{border:1px dashed #65717e;border-radius:8px;padding:13px;text-align:center;color:var(--dim);margin:10px 0}.drop.drag{border-color:var(--accent);background:#1c2b3b}
+#fileName{font-size:12px;color:var(--dim);overflow-wrap:anywhere;margin-top:7px}
+#status{font-size:12px;color:var(--dim);min-height:34px;margin-top:10px;white-space:pre-wrap}#status.error{color:var(--err)}#status.good{color:#8bd49c}
+.stat{display:flex;justify-content:space-between;color:var(--dim);font-size:12px;padding:3px 0;border-bottom:1px solid #303841}
+main{position:relative;min-width:0}#view{position:absolute;inset:0}#hint{position:absolute;bottom:12px;left:14px;color:#9aa5b1;font-size:12px;pointer-events:none}
+small.note{display:block;color:var(--dim);font-size:11px;margin-top:3px}
+@media(max-width:760px){#app{grid-template-columns:1fr;grid-template-rows:auto 1fr;height:auto;min-height:100%}aside{border-right:0;border-bottom:1px solid var(--line);max-height:55vh}main{height:55vh;min-height:360px}}
+</style>
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}
+</script>
+</head>
+<body>
+<div id="app">
+<aside>
+  <h1>ChemSTL</h1>
+  <p class="sub">Molecular ball-and-stick model to printable STL. Processing stays in your browser.</p>
+  <div id="drop" class="drop">Drop an Avogadro CJSON, Avogadro .bs, or XBS .bs file here</div>
+  <div class="row">
+    <button id="choose" class="secondary">Choose file</button>
+    <button id="acetone" class="secondary">Load acetone</button>
+  </div>
+  <input id="file" type="file" accept=".cjson,.json,.bs,.txt,application/json,text/plain" hidden>
+  <div id="fileName">No file loaded</div>
+  <h2>Size (mm)</h2>
+  <label>Carbon radius <input id="carbonRadius" type="number" min="1" max="100" step=".5" value="22"></label>
+  <label>Bond thickness <input id="bondThickness" type="number" min=".5" max="30" step=".5" value="6"></label>
+  <label>Thickness is <select id="thicknessMode"><option value="diameter" selected>Diameter</option><option value="radius">Radius</option></select></label>
+  <label>Multiple bonds <select id="multipleMode"><option value="sticks" selected>Separate sticks</option><option value="single">Single stick</option></select></label>
+  <label>Mesh detail <select id="detail"><option value="low">Low</option><option value="medium" selected>Medium</option><option value="high">High</option></select></label>
+  <div class="row" style="margin-top:10px"><button id="rebuild" class="secondary">Update model</button><button id="export" disabled>Download STL</button></div>
+  <h2>Model</h2>
+  <div class="stat"><span>Input format</span><span id="format">—</span></div>
+  <div class="stat"><span>Atoms</span><span id="atoms">—</span></div>
+  <div class="stat"><span>Bonds</span><span id="bonds">—</span></div>
+  <div class="stat"><span>Single / double / triple</span><span id="bondTypes">—</span></div>
+  <div class="stat"><span>Aromatic</span><span id="aromatic">—</span></div>
+  <div id="status">Load a molecule file to begin.</div>
+  <small class="note">STL export contains overlapping closed shells for atoms and bonds. Most slicers automatically union these during slicing.</small>
+</aside>
+<main><div id="view"></div><div id="hint">Drag: rotate · Wheel: zoom · Right-drag: pan</div></main>
+</div>
+<script type="module">
+import * as THREE from 'three';
+import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
+import {STLExporter} from 'three/addons/exporters/STLExporter.js';
+
+const $ = id => document.getElementById(id);
+const ELEMENTS = {1:'H',2:'He',3:'Li',4:'Be',5:'B',6:'C',7:'N',8:'O',9:'F',10:'Ne',11:'Na',12:'Mg',13:'Al',14:'Si',15:'P',16:'S',17:'Cl',18:'Ar',19:'K',20:'Ca',26:'Fe',29:'Cu',30:'Zn',35:'Br',53:'I'};
+const RADII = {H:0.31,He:0.28,Li:1.28,Be:0.96,B:0.84,C:0.76,N:0.71,O:0.66,F:0.57,Na:1.66,Mg:1.41,Al:1.21,Si:1.11,P:1.07,S:1.05,Cl:1.02,K:2.03,Ca:1.76,Fe:1.24,Cu:1.32,Zn:1.22,Br:1.20,I:1.39};
+const COLORS = {H:0xffffff,C:0x333333,N:0x3050f8,O:0xff0d0d,F:0x90e050,Cl:0x1ff01f,Br:0xa62929,I:0x940094,S:0xffff30,P:0xff8000,Na:0xab5cf2,Fe:0xe06633,Cu:0xc88033};
+let parsed=null, currentGroup=null, currentTitle='molecule';
+const scene = new THREE.Scene(); scene.background=new THREE.Color(0x1b1f24);
+const camera=new THREE.PerspectiveCamera(45,1,.1,100000); camera.position.set(130,100,150);
+const renderer=new THREE.WebGLRenderer({antialias:true}); renderer.setPixelRatio(Math.min(devicePixelRatio,2)); renderer.outputColorSpace=THREE.SRGBColorSpace;
+$('view').appendChild(renderer.domElement);
+const controls=new OrbitControls(camera,renderer.domElement); controls.enableDamping=true;
+scene.add(new THREE.HemisphereLight(0xffffff,0x39424d,2));
+const key=new THREE.DirectionalLight(0xffffff,2.1);key.position.set(80,120,100);scene.add(key);
+const fill=new THREE.DirectionalLight(0xffffff,.8);fill.position.set(-100,-50,-80);scene.add(fill);
+function resize(){const w=$('view').clientWidth,h=$('view').clientHeight;camera.aspect=w/h;camera.updateProjectionMatrix();renderer.setSize(w,h)}
+new ResizeObserver(resize).observe($('view'));resize();
+function animate(){requestAnimationFrame(animate);controls.update();renderer.render(scene,camera)}animate();
+
+function parseCJSON(text){
+  let d;try{d=JSON.parse(text.replace(/^\\uFEFF/,''));}catch(e){throw Error('Invalid JSON: '+e.message)}
+  if(!d||!d.atoms||!d.atoms.elements||!Array.isArray(d.atoms.elements.number))throw Error('CJSON is missing atoms.elements.number.');
+  const nums=d.atoms.elements.number;
+  const xyz=d.atoms.coords?.['3d'];
+  if(!Array.isArray(xyz))throw Error('CJSON needs Cartesian atoms.coords.3d coordinates.');
+  if(xyz.length!==nums.length*3)throw Error(`Coordinate count mismatch: ${nums.length} atoms require ${nums.length*3} coordinate values.`);
+  const atoms=nums.map((n,i)=>{const sym=ELEMENTS[n];if(!sym)throw Error(`Unsupported atomic number ${n} at atom ${i+1}.`);const p=xyz.slice(i*3,i*3+3).map(Number);if(!p.every(Number.isFinite))throw Error(`Invalid coordinates for atom ${i+1}.`);return {sym,x:p[0],y:p[1],z:p[2]};});
+  const conn=d.bonds?.connections?.index, orders=d.bonds?.order;
+  const explicit=Array.isArray(conn);
+  const bonds=[];
+  if(explicit){
+    if(conn.length%2)throw Error('CJSON bond connection list must contain atom-index pairs.');
+    if(Array.isArray(orders)&&orders.length!==conn.length/2)throw Error('CJSON bond-order count does not match bond count.');
+    for(let k=0;k<conn.length;k+=2){
+      const a=Number(conn[k]),b=Number(conn[k+1]);if(!Number.isInteger(a)||!Number.isInteger(b)||a<0||b<0||a>=atoms.length||b>=atoms.length||a===b)throw Error(`Invalid bond atom indices at bond ${k/2+1}.`);
+      let order=orders?Number(orders[k/2]):1;if(!Number.isFinite(order)||order<=0)order=1;if(order===4)order=1.5;
+      bonds.push({i:a,j:b,order});
+    }
+  }
+  return {atoms,bonds,hasExplicitBonds:explicit,format:'CJSON',title:d.name||'molecule'};
+}
+function parseAvogadroBS(text){
+  const lines=text.replace(/^\\uFEFF/,'').split(/\\r?\\n/).map(s=>s.trim()).filter(Boolean);
+  if(lines.length<3)throw Error('The .bs file is too short.');
+  const count=Number(lines[1]);if(!Number.isInteger(count)||count<1||count>100000)throw Error('Not a recognized Avogadro BallAndStick .bs file.');
+  if(lines.length<count+2)throw Error(`File declares ${count} atoms but only ${lines.length-2} atom records were found.`);
+  const atoms=lines.slice(2,2+count).map((line,i)=>{const p=line.split(/\\s+/);if(p.length<4)throw Error(`Malformed atom row ${i+1}.`);const sym=p[0],x=Number(p[1]),y=Number(p[2]),z=Number(p[3]);if(!Object.values(ELEMENTS).includes(sym)||![x,y,z].every(Number.isFinite))throw Error(`Malformed atom row ${i+1}.`);return {sym,x,y,z};});
+  const bonds=[],seen=new Set();
+  lines.slice(2,2+count).forEach((line,i)=>{const p=line.split(/\\s+/);for(const v of p.slice(4)){const j=Number(v)-1;if(Number.isInteger(j)&&j>=0&&j<atoms.length&&j!==i){const key=[Math.min(i,j),Math.max(i,j)].join(':');if(!seen.has(key)){seen.add(key);bonds.push({i:Math.min(i,j),j:Math.max(i,j),order:1});}}}});
+  return {atoms,bonds,hasExplicitBonds:true,format:'Avogadro .bs',title:lines[0]||'molecule'};
+}
+function parseXBS(text){
+  // Accepts the compact XBS records used by the original ChemSTL examples.
+  const lines=text.replace(/^\\uFEFF/,'').split(/\\r?\\n/).map(s=>s.trim()).filter(s=>s&&!s.startsWith('#'));
+  const atoms=[],bonds=[];let specs={};
+  for(const line of lines){
+    const p=line.split(/[\\s,]+/),tag=p[0].toLowerCase();
+    if(tag==='atom'){
+      let sym,x,y,z;
+      if(p.length>=5&&/^\\d+$/.test(p[1])){sym=p[2];x=+p[3];y=+p[4];z=+p[5]}
+      else {sym=p[1];x=+p[2];y=+p[3];z=+p[4]}
+      if(sym&&[x,y,z].every(Number.isFinite))atoms.push({sym,x,y,z});
+    } else if(tag==='bond'&&p.length>=3){bonds.push({i:+p[1],j:+p[2],order:+(p[3]||1)});}
+    else if(tag==='bonds'){
+      const nums=p.slice(1).map(Number).filter(Number.isFinite);for(let k=0;k+1<nums.length;k+=2)bonds.push({i:nums[k],j:nums[k+1],order:1});
+    } else if(tag==='spec'&&p.length>=3){specs[p[1]]=Number(p[2]);}
+  }
+  if(!atoms.length)throw Error('No atom records found. Use Avogadro Save As → Chemical JSON (.cjson), or export a BallAndStick .bs file.');
+  const zeroBased=bonds.some(b=>b.i===0||b.j===0);
+  for(const b of bonds){if(!zeroBased){b.i--;b.j--;}}
+  return {atoms,bonds,hasExplicitBonds:bonds.length>0,format:'XBS .bs',title:'molecule',specs};
+}
+function parseMolecule(text){
+  const clean=text.replace(/^\\uFEFF/,'').trim();if(!clean)throw Error('The selected file is empty.');
+  if(clean.startsWith('{'))return parseCJSON(clean);
+  const lines=clean.split(/\\r?\\n/).map(s=>s.trim()).filter(Boolean);
+  if(lines.length>1&&/^\\d+$/.test(lines[1]))return parseAvogadroBS(clean);
+  return parseXBS(clean);
+}
+function inferBonds(atoms){
+  const out=[];for(let i=0;i<atoms.length;i++)for(let j=i+1;j<atoms.length;j++){
+    const a=atoms[i],b=atoms[j],r=(RADII[a.sym]||.8)+(RADII[b.sym]||.8),d=Math.hypot(a.x-b.x,a.y-b.y,a.z-b.z);
+    if(d>.1&&d<r*1.22)out.push({i,j,order:1});
+  }return out;
+}
+function clearModel(){if(currentGroup){scene.remove(currentGroup);currentGroup.traverse(o=>{o.geometry?.dispose();if(o.material){if(Array.isArray(o.material))o.material.forEach(m=>m.dispose());else o.material.dispose()}});currentGroup=null;}}
+function build(){
+  if(!parsed)return;
+  const carbon=Number($('carbonRadius').value),thick=Number($('bondThickness').value);
+  if(!(carbon>0&&thick>0))throw Error('Enter positive atom and bond dimensions.');
+  const detail=$('detail').value,seg=detail==='low'?12:detail==='high'?32:20, rings=detail==='low'?8:detail==='high'?20:14;
+  const source=parsed.atoms, carbonSource=source.find(a=>a.sym==='C');
+  const scale=carbonSource?(carbon/(RADII.C||.76)):carbon/(RADII[carbonSource?.sym]||.76);
+  const coords=source.map(a=>new THREE.Vector3(a.x*scale,a.y*scale,a.z*scale));
+  const center=new THREE.Vector3();coords.forEach(p=>center.add(p));center.multiplyScalar(1/coords.length);coords.forEach(p=>p.sub(center));
+  const bonds=parsed.hasExplicitBonds?parsed.bonds:inferBonds(source);
+  const group=new THREE.Group(), sphereGeo=new THREE.SphereGeometry(1,seg,rings);
+  const matCache={};
+  function mat(color){if(!matCache[color])matCache[color]=new THREE.MeshStandardMaterial({color,roughness:.43,metalness:.04});return matCache[color]}
+  const baseRadius=carbon;
+  source.forEach((a,i)=>{
+    const cov=RADII[a.sym]||.8,rad=baseRadius*cov/RADII.C;
+    const mesh=new THREE.Mesh(sphereGeo,mat(COLORS[a.sym]??0xb7bec8));mesh.position.copy(coords[i]);mesh.scale.setScalar(rad);mesh.castShadow=true;mesh.receiveShadow=true;group.add(mesh);
+  });
+  const thickness=$('thicknessMode').value==='diameter'?thick/2:thick;
+  const cylGeo=new THREE.CylinderGeometry(thickness,thickness,1,Math.max(8,seg),1,false);
+  const yAxis=new THREE.Vector3(0,1,0);
+  bonds.forEach(b=>{
+    if(!Number.isInteger(b.i)||!Number.isInteger(b.j)||!coords[b.i]||!coords[b.j]||b.i===b.j)return;
+    const start=coords[b.i],end=coords[b.j],delta=new THREE.Vector3().subVectors(end,start),length=delta.length();if(length<.001)return;
+    const order=$('multipleMode').value==='single'?1:(b.order===1.5?2:Math.max(1,Math.min(3,Math.round(b.order||1))));
+    const direction=delta.clone().normalize(),ref=Math.abs(direction.y)<.9?new THREE.Vector3(0,1,0):new THREE.Vector3(1,0,0),side=new THREE.Vector3().crossVectors(direction,ref).normalize();
+    const offsets=order===1?[0]:order===2?[-thickness*1.35,thickness*1.35]:[-thickness*2,0,thickness*2];
+    offsets.forEach((off,k)=>{
+      const a=start.clone().addScaledVector(side,off),z=end.clone().addScaledVector(side,off);
+      const mid=a.clone().add(z).multiplyScalar(.5),len=a.distanceTo(z);
+      const mesh=new THREE.Mesh(cylGeo,mat(0xc3cbd4));mesh.position.copy(mid);mesh.scale.set(1,len,1);mesh.quaternion.setFromUnitVectors(yAxis,new THREE.Vector3().subVectors(z,a).normalize());group.add(mesh);
+    });
+  });
+  clearModel();currentGroup=group;scene.add(group);
+  const box=new THREE.Box3().setFromObject(group),size=box.getSize(new THREE.Vector3()),max=Math.max(size.x,size.y,size.z,1);
+  camera.position.set(max*1.5,max*1.1,max*1.6);controls.target.set(0,0,0);controls.update();camera.near=Math.max(.01,max/1000);camera.far=max*100;camera.updateProjectionMatrix();
+  $('atoms').textContent=source.length;$('bonds').textContent=bonds.length;$('format').textContent=parsed.format;
+  const singles=bonds.filter(b=>(b.order||1)===1).length,doubles=bonds.filter(b=>(b.order||1)===2).length,triples=bonds.filter(b=>(b.order||1)===3).length,arom=bonds.filter(b=>b.order===1.5).length;
+  $('bondTypes').textContent=`${singles} / ${doubles} / ${triples}`;$('aromatic').textContent=arom;
+  $('export').disabled=false;
+}
+function setStatus(msg,kind=''){ $('status').textContent=msg;$('status').className=kind; }
+async function loadFile(file){
+  try{const text=await file.text();parsed=parseMolecule(text);currentTitle=(parsed.title||file.name.replace(/\.[^.]+$/,'' )||'molecule').replace(/[^\w.-]+/g,'_');$('fileName').textContent=file.name;build();setStatus(`Loaded ${parsed.format}: ${parsed.atoms.length} atoms, ${parsed.bonds.length||'inferred'} bonds.`, 'good');}
+  catch(e){parsed=null;$('export').disabled=true;setStatus(e.message,'error');}
+}
+$('choose').onclick=()=>$('file').click();$('file').onchange=e=>{if(e.target.files[0])loadFile(e.target.files[0]);};
+$('drop').addEventListener('dragover',e=>{e.preventDefault();$('drop').classList.add('drag')});
+$('drop').addEventListener('dragleave',()=>$('drop').classList.remove('drag'));
+$('drop').addEventListener('drop',e=>{e.preventDefault();$('drop').classList.remove('drag');if(e.dataTransfer.files[0])loadFile(e.dataTransfer.files[0]);});
+$('rebuild').onclick=()=>{try{build();setStatus('Model updated.','good')}catch(e){setStatus(e.message,'error')}};
+['carbonRadius','bondThickness','thicknessMode','multipleMode','detail'].forEach(id=>$(id).addEventListener('change',()=>{if(parsed){try{build()}catch(e){setStatus(e.message,'error')}}}));
+$('export').onclick=()=>{
+  if(!currentGroup)return;
+  try{
+    const exporter=new STLExporter();const data=exporter.parse(currentGroup,{binary:true});
+    const blob=new Blob([data],{type:'model/stl'}),url=URL.createObjectURL(blob),a=document.createElement('a');
+    a.href=url;a.download=`${currentTitle||'molecule'}.stl`;document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(url);
+    setStatus('STL exported.','good');
+  }catch(e){setStatus('STL export failed: '+e.message,'error')}
+};
+const acetone=`Untitled
+10
+C 1.3051 -0.6772 -0.0000 2 5 6 7
+C 0.0000 0.0763 -0.0000 1 3 4
+O -0.0000 1.2839 0.0000 2
+C -1.3051 -0.6772 0.0000 2 8 9 10
+H 1.6198 -0.8588 1.0277 1
+H 1.1748 -1.6296 -0.5138 1
+H 2.0647 -0.0881 -0.5138 1
+H -1.1059 -1.7488 -0.0000 4
+H -1.8767 -0.4138 0.8900 4
+H -1.8767 -0.4138 -0.8900 4`;
+$('acetone').onclick=()=>{try{parsed=parseAvogadroBS(acetone);currentTitle='acetone';$('fileName').textContent='Built-in acetone example';build();setStatus('Loaded built-in acetone example.','good')}catch(e){setStatus(e.message,'error')}};
+</script>
+</body>
+</html>
